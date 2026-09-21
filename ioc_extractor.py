@@ -152,8 +152,6 @@ def extract_iocs(text: str, filter_private: bool = True) -> Dict[str, List[str]]
         try:
             ip_obj = ipaddress.ip_address(ip)
             if ip_obj.version == 6:
-                if filter_private and is_private_ip(ip):
-                    continue
                 results["ipv6"].add(ip)
         except ValueError:
             pass  # Not a valid IP address
@@ -176,7 +174,6 @@ def extract_iocs(text: str, filter_private: bool = True) -> Dict[str, List[str]]
         domain = match.group().lower()
         if (
             domain in _DOMAIN_EXCLUSIONS
-            or domain in url_domains
             or domain in email_domains
             or domain in results["ipv4"]
         ):

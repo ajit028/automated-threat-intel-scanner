@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  scanner:
+    build: .
+    image: automated-threat-intel-scanner:latest
+    container_name: threat_intel_scanner
+    volumes:
+      - .:/app
+    environment:
+      - CACHE_DB_PATH=/app/scan_cache.db
+      - VT_API_KEY=${VT_API_KEY:-}
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
+      - MISP_URL=${MISP_URL:-}
+      - MISP_API_KEY=${MISP_API_KEY:-}
+      - MISP_VERIFY_CERT=${MISP_VERIFY_CERT:-false}
+
+  api:
+    build: .
+    image: automated-threat-intel-scanner:latest
+    container_name: threat_intel_api
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - CACHE_DB_PATH=/app/scan_cache.db
+      - VT_API_KEY=${VT_API_KEY:-}
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
+      - MISP_URL=${MISP_URL:-}
+      - MISP_API_KEY=${MISP_API_KEY:-}
+      - MISP_VERIFY_CERT=${MISP_VERIFY_CERT:-false}

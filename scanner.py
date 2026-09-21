@@ -12,6 +12,7 @@ Subcommands:
 Usage:
     python scanner.py scan --input incident.log --output report.md --format markdown
     python scanner.py scan --ioc "185.220.101.5"
+    python scanner.py scan --input incident.log --misp-export
     python scanner.py config --vt-key "YOUR_KEY" --abuseipdb-key "YOUR_KEY"
     python scanner.py config --show
 """
@@ -29,6 +30,9 @@ import requests
 from config import load_config, save_config
 from ioc_extractor import extract_from_file, extract_iocs
 from report_generator import generate_json_report, generate_markdown_report
+from stix_export import generate_stix_bundle
+from misp_export import export_to_misp
+from cache import get_cached_result, set_cached_result
 
 # ─── ANSI Color Codes ───────────────────────────────────────────────────────
 RED = "\033[91m"
@@ -39,7 +43,7 @@ BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ─── Threat Intelligence Lookups ────────────────────────────────────────────
 
@@ -174,11 +178,17 @@ def enrich_ioc(
 ) -> Dict[str, Any]:
     """
     Perform full enrichment for a single IOC:
-    1. Query VirusTotal (if applicable)
-    2. Query AbuseIPDB (if IP)
-    3. Calculate risk score + classification
+    1. Check SQLite cache (< 24h old)
+    2. Query VirusTotal (if applicable)
+    3. Query AbuseIPDB (if IP)
+    4. Calculate risk score + classification & cache result
     Returns a unified result record.
     """
+    cached = get_cached_result(ioc)
+    if cached:
+        cached["cached"] = True
+        return cached
+
     vt_data = {"vt_malicious": 0, "vt_total": 0, "vt_result": "skipped"}
     abuse_data = None
 
@@ -186,7 +196,8 @@ def enrich_ioc(
     if ioc_type in ("ipv4", "domain", "md5", "sha1", "sha256", "url"):
         vt_data = query_virustotal(ioc, ioc_type, config.get("vt_api_key", ""))
 
-    time.sleep(rate_limit)
+    if rate_limit > 0:
+        time.sleep(rate_limit)
 
     # AbuseIPDB lookup — IPs only
     if ioc_type == "ipv4":
@@ -207,15 +218,18 @@ def enrich_ioc(
     if not detail_parts:
         detail_parts.append(f"VT: {vt_data.get('vt_result', 'no data')}")
 
-    return {
+    res = {
         "ioc": ioc,
         "type": ioc_type,
         "risk_score": risk_score,
         "classification": classification,
         "details": " | ".join(detail_parts),
         "vt": vt_data,
-        "abuseipdb": abuse_data or {}
+        "abuseipdb": abuse_data or {},
+        "cached": False
     }
+    set_cached_result(ioc, ioc_type, res)
+    return res
 
 
 def print_result(record: Dict) -> None:
@@ -231,6 +245,41 @@ def print_result(record: Dict) -> None:
         f"{DIM}({ioc_type}){RESET} | "
         f"Risk Score: {color}{risk}/100{RESET} | {details}"
     )
+
+
+def scan_iocs_sync(ioc_dict: Dict[str, List[str]], config: Dict, verbose: bool = True) -> List[Dict]:
+    """
+    Programmatic helper to enrich an IOC dictionary.
+    """
+    ioc_pairs: List[tuple] = []
+    for ioc_type, ioc_list in ioc_dict.items():
+        for ioc in ioc_list:
+            ioc_pairs.append((ioc, ioc_type))
+
+    total = len(ioc_pairs)
+    if total == 0:
+        return []
+
+    max_threads = config.get("max_threads", 5)
+    rate_limit = config.get("rate_limit_seconds", 1.0)
+
+    results: List[Dict] = []
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures_map = {
+            executor.submit(enrich_ioc, ioc, ioc_type, config, rate_limit): (ioc, ioc_type)
+            for ioc, ioc_type in ioc_pairs
+        }
+        for future in as_completed(futures_map):
+            completed += 1
+            record = future.result()
+            results.append(record)
+            if verbose:
+                print(f"  {DIM}[{completed}/{total}]{RESET} Scanning...", end="\r")
+                print_result(record)
+
+    return results
 
 
 def run_scan(args: argparse.Namespace, config: Dict) -> List[Dict]:
@@ -259,13 +308,7 @@ def run_scan(args: argparse.Namespace, config: Dict) -> List[Dict]:
         print(f"{RED}[-] Provide --input <file> or --ioc <value>{RESET}")
         sys.exit(1)
 
-    # Flatten to list of (ioc, type) tuples
-    ioc_pairs: List[tuple] = []
-    for ioc_type, ioc_list in all_iocs.items():
-        for ioc in ioc_list:
-            ioc_pairs.append((ioc, ioc_type))
-
-    total = len(ioc_pairs)
+    total = sum(len(v) for v in all_iocs.values())
     if total == 0:
         print(f"{YELLOW}[!] No IOCs found in input.{RESET}")
         return []
@@ -279,21 +322,7 @@ def run_scan(args: argparse.Namespace, config: Dict) -> List[Dict]:
         f"(rate limit: {rate_limit}s/req){RESET}\n"
     )
 
-    results: List[Dict] = []
-    completed = 0
-
-    # ── Concurrent Enrichment ─────────────────────────────────────────────
-    with ThreadPoolExecutor(max_workers=max_threads) as executor:
-        futures_map = {
-            executor.submit(enrich_ioc, ioc, ioc_type, config, rate_limit): (ioc, ioc_type)
-            for ioc, ioc_type in ioc_pairs
-        }
-        for future in as_completed(futures_map):
-            completed += 1
-            print(f"  {DIM}[{completed}/{total}]{RESET} Scanning...", end="\r")
-            record = future.result()
-            results.append(record)
-            print_result(record)
+    results = scan_iocs_sync(all_iocs, config, verbose=True)
 
     # ── Summary ───────────────────────────────────────────────────────────
     malicious_count = sum(1 for r in results if r["classification"] == "MALICIOUS")
@@ -321,6 +350,13 @@ def cmd_scan(args: argparse.Namespace) -> None:
     if not results:
         return
 
+    if getattr(args, "stix_output", None):
+        generate_stix_bundle(results, output_file=args.stix_output)
+
+    if getattr(args, "misp_export", False):
+        event_name = getattr(args, "misp_event_name", None)
+        export_to_misp(results, config, event_name=event_name)
+
     output_file = getattr(args, "output", None)
     fmt = getattr(args, "format", "markdown")
 
@@ -330,9 +366,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
         else:
             generate_markdown_report(results, output_file=output_file)
         print(f"{GREEN}[+] Report saved: {output_file}{RESET}")
-    else:
-        # No output file — print JSON to stdout
-        print(json.dumps(results, indent=2))
+    elif not getattr(args, "stix_output", None) and not getattr(args, "misp_export", False):
+        pass
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -357,14 +392,24 @@ def cmd_config(args: argparse.Namespace) -> None:
         print(f"\n{BOLD}Current Configuration:{RESET}")
         vt_key = config.get("vt_api_key", "")
         ab_key = config.get("abuseipdb_api_key", "")
+        misp_url = config.get("misp_url", "")
+        misp_key = config.get("misp_api_key", "")
         print(f"  VT API Key:        {'*' * len(vt_key[:6])}... ({len(vt_key)} chars)" if vt_key else "  VT API Key:        (not set)")
         print(f"  AbuseIPDB API Key: {'*' * len(ab_key[:6])}... ({len(ab_key)} chars)" if ab_key else "  AbuseIPDB API Key: (not set)")
+        print(f"  MISP URL:          {misp_url if misp_url else '(not set)'}")
+        print(f"  MISP API Key:      {'*' * len(misp_key[:6])}... ({len(misp_key)} chars)" if misp_key else "  MISP API Key:      (not set)")
+        print(f"  MISP Verify SSL:   {config.get('misp_verify_cert', False)}")
         print(f"  Max Threads:       {config.get('max_threads', 5)}")
         print(f"  Rate Limit:        {config.get('rate_limit_seconds', 1.0)}s\n")
     else:
         save_config(
             vt_key=getattr(args, "vt_key", None),
-            abuseipdb_key=getattr(args, "abuseipdb_key", None)
+            abuseipdb_key=getattr(args, "abuseipdb_key", None),
+            misp_url=getattr(args, "misp_url", None),
+            misp_key=getattr(args, "misp_key", None),
+            misp_verify_cert=getattr(args, "misp_verify_cert", None),
+            rate_limit=getattr(args, "rate_limit", None),
+            max_threads=getattr(args, "max_threads", None),
         )
 
 
@@ -383,6 +428,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  python scanner.py scan --input incident.log --output report.md\n"
             "  python scanner.py scan --ioc 185.220.101.5\n"
+            "  python scanner.py scan --input incident.log --misp-export\n"
             "  python scanner.py scan --input incident.log --format json --output result.json\n"
             "  python scanner.py report --json-file result.json --output report.md\n"
             "  python scanner.py config --vt-key YOURKEY --abuseipdb-key YOURKEY\n"
@@ -395,14 +441,20 @@ def build_parser() -> argparse.ArgumentParser:
     # ── scan ──────────────────────────────────────────────────────────────
     scan_p = sub.add_parser("scan", help="Extract and enrich IOCs from a file or direct input")
     group = scan_p.add_mutually_exclusive_group(required=True)
-    group.add_argument("--input", "-i", metavar="FILE",
+    group.add_argument("--input", "--log", "-i", metavar="FILE", dest="input",
                        help="Path to incident log / text file to scan (use '-' for stdin)")
     group.add_argument("--ioc", metavar="IOC",
                        help="Single IOC to scan (IP, hash, domain, etc.)")
     scan_p.add_argument("--output", "-o", metavar="FILE",
-                        help="Output file path for the report")
+                       help="Output file path for the report")
+    scan_p.add_argument("--stix-output", metavar="FILE",
+                       help="Export detected IOCs as a STIX 2.1 JSON bundle")
+    scan_p.add_argument("--misp-export", action="store_true",
+                       help="Export detected malicious/suspicious IOCs to MISP")
+    scan_p.add_argument("--misp-event-name", metavar="NAME",
+                       help="Custom name for the MISP event")
     scan_p.add_argument("--format", "-f", choices=["markdown", "json"],
-                        default="markdown", help="Output report format (default: markdown)")
+                       default="markdown", help="Output report format (default: markdown)")
     scan_p.set_defaults(func=cmd_scan)
 
     # ── report ─────────────────────────────────────────────────────────────
@@ -419,6 +471,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Set VirusTotal API key")
     cfg_p.add_argument("--abuseipdb-key", dest="abuseipdb_key", metavar="KEY",
                        help="Set AbuseIPDB API key")
+    cfg_p.add_argument("--misp-url", dest="misp_url", metavar="URL",
+                       help="Set MISP instance URL")
+    cfg_p.add_argument("--misp-key", dest="misp_key", metavar="KEY",
+                       help="Set MISP API key")
+    cfg_p.add_argument("--misp-verify-cert", dest="misp_verify_cert", type=bool,
+                       help="Verify SSL certificate for MISP (True/False)")
+    cfg_p.add_argument("--rate-limit", dest="rate_limit", type=float,
+                       help="Rate limit per request in seconds")
+    cfg_p.add_argument("--max-threads", dest="max_threads", type=int,
+                       help="Max concurrent enrichment threads")
     cfg_p.add_argument("--show", action="store_true",
                        help="Print current configuration")
     cfg_p.set_defaults(func=cmd_config)
@@ -429,6 +491,8 @@ def build_parser() -> argparse.ArgumentParser:
 # ─── Entry Point ─────────────────────────────────────────────────────────────
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] not in ["scan", "report", "config", "-h", "--help"]:
+        sys.argv.insert(1, "scan")
     parser = build_parser()
     args = parser.parse_args()
     args.func(args)

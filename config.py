@@ -13,11 +13,14 @@ def load_config():
     """
     Load configuration from file or environment variables.
     Returns a dict with keys:
-        vt_api_key, abuseipdb_api_key, rate_limit_seconds, max_threads
+        vt_api_key, abuseipdb_api_key, misp_url, misp_api_key, misp_verify_cert, rate_limit_seconds, max_threads
     """
     config = {
         "vt_api_key": os.getenv("VT_API_KEY", ""),
         "abuseipdb_api_key": os.getenv("ABUSEIPDB_API_KEY", ""),
+        "misp_url": os.getenv("MISP_URL", ""),
+        "misp_api_key": os.getenv("MISP_API_KEY", ""),
+        "misp_verify_cert": os.getenv("MISP_VERIFY_CERT", "false").lower() in ("true", "1", "yes"),
         "rate_limit_seconds": 1.0,
         "max_threads": 5,
     }
@@ -32,7 +35,15 @@ def load_config():
 
     return config
 
-def save_config(vt_key=None, abuseipdb_key=None, rate_limit=None, max_threads=None):
+def save_config(
+    vt_key=None,
+    abuseipdb_key=None,
+    misp_url=None,
+    misp_key=None,
+    misp_verify_cert=None,
+    rate_limit=None,
+    max_threads=None
+):
     """
     Save configuration to file. Only non-None values are updated.
     """
@@ -41,6 +52,12 @@ def save_config(vt_key=None, abuseipdb_key=None, rate_limit=None, max_threads=No
         config["vt_api_key"] = vt_key
     if abuseipdb_key is not None:
         config["abuseipdb_api_key"] = abuseipdb_key
+    if misp_url is not None:
+        config["misp_url"] = misp_url
+    if misp_key is not None:
+        config["misp_api_key"] = misp_key
+    if misp_verify_cert is not None:
+        config["misp_verify_cert"] = bool(misp_verify_cert)
     if rate_limit is not None:
         config["rate_limit_seconds"] = float(rate_limit)
     if max_threads is not None:

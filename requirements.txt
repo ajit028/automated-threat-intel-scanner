@@ -1,2 +1,8 @@
 requests>=2.28.0
 colorama>=0.4.6 ; sys_platform == "win32"
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pymisp>=2.4.170
+python-multipart>=0.0.6
+pytest>=7.0.0
+httpx>=0.24.0
